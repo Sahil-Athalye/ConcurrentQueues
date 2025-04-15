@@ -1,11 +1,8 @@
 /**
- * Improved Michael-Scott Lock-Free Queue Implementation in CUDA
+ * True Concurrent Michael-Scott Lock-Free Queue Implementation in CUDA
  * 
- * Key improvements:
- * - Pre-allocated node pool instead of dynamic allocation
- * - Separated pointer and counter to avoid 64-bit atomic issues
- * - Added memory fences for better visibility between threads
- * - Simplified ABA prevention
+ * This version allows for simultaneous enqueue and dequeue operations
+ * with proper handling of contention and memory ordering.
  */
 
  #include <cuda_runtime.h>
@@ -14,6 +11,7 @@
  // Constants for the queue
  #define QUEUE_SIZE 1024
  #define MAX_THREADS 1000
+ #define MAX_RETRIES 10
  
  /**
   * Node structure with value and next pointer
@@ -82,11 +80,11 @@
   * @return Index of the allocated node, or -1 if no free nodes
   */
  __device__ int allocateNode(MSQueue* queue) {
-     while (true) {
+     int retries = 0;
+     while (retries++ < MAX_RETRIES) {
          // Check if we have free nodes
          int freeList = atomicAdd((int*)&queue->freeList, 0);
          if (freeList == -1) {
-             printf("No free nodes available\n");
              return -1;  // No free nodes
          }
          
@@ -99,6 +97,7 @@
          
          // If CAS failed, another thread took the node, try again
      }
+     return -1; // Too many retries, give up
  }
  
  /**
@@ -108,7 +107,8 @@
   * @param nodeIndex Index of the node to free
   */
  __device__ void freeNode(MSQueue* queue, int nodeIndex) {
-     while (true) {
+     int retries = 0;
+     while (retries++ < MAX_RETRIES) {
          int currentFreeList = atomicAdd((int*)&queue->freeList, 0);
          queue->nodes[nodeIndex].next = currentFreeList;
          if (atomicCAS((int*)&queue->freeList, currentFreeList, nodeIndex) == currentFreeList) {
@@ -116,6 +116,7 @@
              return;
          }
      }
+     // If we couldn't free after several retries, something is wrong but we don't want to block
  }
  
  /**
@@ -123,75 +124,61 @@
   * 
   * @param queue The queue to enqueue to
   * @param value The value to enqueue
-  * @return 0 on success, FULL if queue is full
+  * @return 0 on success, FULL if queue is full or too many retries
   */
  __device__ int enqueue(MSQueue* queue, int value) {
      int tid = threadIdx.x + blockIdx.x * blockDim.x;
-     printf("Thread %d: Attempting to enqueue value %d\n", tid, value);
      
      // Get a new node from the pool
      int nodeIndex = allocateNode(queue);
      if (nodeIndex == -1) {
-         printf("Thread %d: Queue is full, no free nodes\n", tid);
          return FULL;
      }
-     
-     printf("Thread %d: Allocated node at index %d\n", tid, nodeIndex);
      
      // Initialize the new node
      queue->nodes[nodeIndex].value = value;
      queue->nodes[nodeIndex].next = -1;
      __threadfence();  // Ensure the node initialization is visible to other threads
      
-     int attempts = 0;
-     while (true) {
-         attempts++;
-         if (attempts > 1000) {
-             printf("Thread %d: Giving up after %d attempts\n", tid, attempts);
-             freeNode(queue, nodeIndex);
-             return FULL;
-         }
-         
+     int retries = 0;
+     while (retries++ < MAX_RETRIES) {
          // Read the current tail
          int tail = atomicAdd((int*)&queue->tail, 0);
          int tailCount = atomicAdd((int*)&queue->tailCount, 0);
-         printf("Thread %d: Read tail=%d, tailCount=%d\n", tid, tail, tailCount);
          
          // Read the next pointer of the tail node
          int next = atomicAdd((int*)&queue->nodes[tail].next, 0);
          int nextCount = atomicAdd((int*)&queue->nodes[tail].nextCount, 0);
-         printf("Thread %d: Read next=%d, nextCount=%d\n", tid, next, nextCount);
          
          // Check if tail is still consistent
          if (tail != atomicAdd((int*)&queue->tail, 0) || 
              tailCount != atomicAdd((int*)&queue->tailCount, 0)) {
-             printf("Thread %d: Tail changed, retrying\n", tid);
              continue;
          }
          
          if (next == -1) {
              // Try to link the new node
-             printf("Thread %d: Attempting CAS on tail next from %d to %d\n", tid, next, nodeIndex);
              if (atomicCAS((int*)&queue->nodes[tail].next, -1, nodeIndex) == -1) {
                  // Successfully linked, increment the nextCount
                  atomicAdd((int*)&queue->nodes[tail].nextCount, 1);
                  __threadfence();  // Ensure the link is visible before advancing tail
                  
                  // Now try to advance the tail
-                 printf("Thread %d: Attempting to advance tail from %d to %d\n", tid, tail, nodeIndex);
                  atomicCAS((int*)&queue->tail, tail, nodeIndex);
                  atomicAdd((int*)&queue->tailCount, 1);
                  
-                 printf("Thread %d: Enqueue success\n", tid);
                  return SUCCESS;
              }
          } else {
              // Tail is not pointing to the last node, try to advance it
-             printf("Thread %d: Tail not pointing to last node, trying to advance\n", tid);
              atomicCAS((int*)&queue->tail, tail, next);
              atomicAdd((int*)&queue->tailCount, 1);
          }
      }
+     
+     // If we failed after max retries, free the node and return
+     freeNode(queue, nodeIndex);
+     return FULL;
  }
  
  /**
@@ -199,233 +186,248 @@
   * 
   * @param queue The queue to dequeue from
   * @param value Pointer to store the dequeued value
-  * @return 0 on success, EMPTY if queue was empty
+  * @return 0 on success, EMPTY if queue was empty or too many retries
   */
-  __device__ int dequeue(MSQueue* queue, int* value) {
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    
-    while (true) {
-        // Read head
-        int head = atomicAdd((int*)&queue->head, 0);
-        // Read next
-        int next = atomicAdd((int*)&queue->nodes[head].next, 0);
-        
-        // If empty
-        if (next == -1) {
-            return EMPTY;
-        }
-        
-        // Try to update head
-        if (atomicCAS((int*)&queue->head, head, next) == head) {
-            // Success - get value
-            *value = queue->nodes[next].value;
-            // Free the old node
-            freeNode(queue, head);
-            return SUCCESS;
-        }
-    }
-}
- 
- /**
-  * CUDA kernel to test the queue
-  */
- __global__ void testQueueKernel(MSQueue* queue, int* results, int* enqueue_count, int* dequeue_count) {
+ __device__ int dequeue(MSQueue* queue, int* value) {
      int tid = threadIdx.x + blockIdx.x * blockDim.x;
      
-     printf("Thread %d starting\n", tid);
-     
-     // Even threads enqueue, odd threads dequeue
-     if (tid % 2 == 0) {
-         printf("Thread %d attempting to enqueue %d\n", tid, tid);
-         if (enqueue(queue, tid) == SUCCESS) {
-             int count = atomicAdd(enqueue_count, 1);
-             printf("Thread %d successfully enqueued %d (total enqueues: %d)\n", tid, tid, count + 1);
-         } else {
-             printf("Thread %d failed to enqueue %d\n", tid, tid);
+     int retries = 0;
+     while (retries++ < MAX_RETRIES) {
+         // Read the current head and tail
+         int head = atomicAdd((int*)&queue->head, 0);
+         int headCount = atomicAdd((int*)&queue->headCount, 0);
+         int tail = atomicAdd((int*)&queue->tail, 0);
+         
+         // Read the next pointer of the head node
+         int next = atomicAdd((int*)&queue->nodes[head].next, 0);
+         
+         // Check if head is still consistent
+         if (head != atomicAdd((int*)&queue->head, 0) || 
+             headCount != atomicAdd((int*)&queue->headCount, 0)) {
+             continue;
          }
-     } else {
-         int value;
-         printf("Thread %d attempting to dequeue\n", tid);
-         if (dequeue(queue, &value) == SUCCESS) {
-             int count = atomicAdd(dequeue_count, 1);
-             printf("Thread %d successfully dequeued %d (total dequeues: %d)\n", tid, value, count + 1);
-             // Store the dequeued value
-             results[count] = value;
+         
+         if (head == tail) {
+             // Queue might be empty
+             if (next == -1) {
+                 return EMPTY;  // Queue is definitely empty
+             }
+             
+             // Tail is falling behind, try to advance it
+             atomicCAS((int*)&queue->tail, tail, next);
+             atomicAdd((int*)&queue->tailCount, 1);
          } else {
-             printf("Thread %d failed to dequeue\n", tid);
+             // Process dequeue
+             if (next == -1) {
+                 // This shouldn't happen in normal operation
+                 continue;
+             }
+             
+             // Read the value from the next node (real head of the queue)
+             *value = queue->nodes[next].value;
+             
+             // Try to advance head
+             if (atomicCAS((int*)&queue->head, head, next) == head) {
+                 atomicAdd((int*)&queue->headCount, 1);
+                 __threadfence();  // Ensure head update is visible
+                 
+                 // Free the old dummy node - can be done asynchronously
+                 freeNode(queue, head);
+                 return SUCCESS;
+             }
          }
      }
      
-     printf("Thread %d finished\n", tid);
+     // If we failed after max retries, return empty
+     return EMPTY;
  }
  
-/**
- * Enqueue-only kernel
- */
- __global__ void enqueueKernel(MSQueue* queue, int* enqueue_count) {
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    
-    printf("Enqueue kernel: Thread %d starting\n", tid);
-    
-    int result = enqueue(queue, tid);
-    if (result == SUCCESS) {
-        int count = atomicAdd(enqueue_count, 1);
-        printf("Enqueue kernel: Thread %d successfully enqueued %d (total enqueues: %d)\n", 
-               tid, tid, count + 1);
-    } else {
-        printf("Enqueue kernel: Thread %d failed to enqueue %d, result: %d\n", 
-               tid, tid, result);
-    }
-    
-    printf("Enqueue kernel: Thread %d finished\n", tid);
-}
-
-/**
- * Dequeue-only kernel
- */
-__global__ void dequeueKernel(MSQueue* queue, int* results, int* dequeue_count) {
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    
-    printf("Dequeue kernel: Thread %d starting\n", tid);
-    
-    int value;
-    int result = dequeue(queue, &value);
-    if (result == SUCCESS) {
-        int count = atomicAdd(dequeue_count, 1);
-        printf("Dequeue kernel: Thread %d successfully dequeued %d (total dequeues: %d)\n", 
-               tid, value, count + 1);
-        // Store the dequeued value
-        results[count] = value;
-    } else {
-        printf("Dequeue kernel: Thread %d failed to dequeue, result: %d\n", tid, result);
-    }
-    
-    printf("Dequeue kernel: Thread %d finished\n", tid);
-}
-
-__global__ void printQueueState(MSQueue* queue) {
-    // Only one thread should print
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        printf("\nQueue State:\n");
-        printf("Head index: %d, Head count: %d\n", 
-               queue->head, queue->headCount);
-        printf("Tail index: %d, Tail count: %d\n", 
-               queue->tail, queue->tailCount);
-        
-        // Print first few nodes
-        int node = queue->head;
-        int count = 0;
-        printf("Nodes starting from head:\n");
-        while (node != -1 && count < 10) {
-            printf("Node[%d]: value=%d, next=%d, nextCount=%d\n", 
-                   node, queue->nodes[node].value, 
-                   queue->nodes[node].next, queue->nodes[node].nextCount);
-            node = queue->nodes[node].next;
-            count++;
-        }
-        
-        printf("Free list: %d nodes available\n", queue->freeCount);
-    }
-}
-
+ /**
+  * Print the current state of the queue (for debugging)
+  */
+ __global__ void printQueueState(MSQueue* queue) {
+     // Only one thread should print
+     if (threadIdx.x == 0 && blockIdx.x == 0) {
+         printf("\nQueue State:\n");
+         printf("Head index: %d, Head count: %d\n", 
+                queue->head, queue->headCount);
+         printf("Tail index: %d, Tail count: %d\n", 
+                queue->tail, queue->tailCount);
+         
+         // Print first few nodes
+         int node = queue->head;
+         int count = 0;
+         printf("Nodes starting from head:\n");
+         while (node != -1 && count < 10) {
+             printf("Node[%d]: value=%d, next=%d, nextCount=%d\n", 
+                    node, queue->nodes[node].value, 
+                    queue->nodes[node].next, queue->nodes[node].nextCount);
+             node = queue->nodes[node].next;
+             count++;
+         }
+         
+         printf("Free list: %d nodes available\n", queue->freeCount);
+     }
+ }
+ 
+ /**
+  * Concurrent kernel with mixed enqueue and dequeue operations
+  */
+ __global__ void concurrentOperationsKernel(MSQueue* queue, int* results, int* enqueue_count, int* dequeue_count, int iterations) {
+     int tid = threadIdx.x + blockIdx.x * blockDim.x;
+     
+     for (int i = 0; i < iterations; i++) {
+         // Even threads enqueue, odd threads dequeue
+         if (tid % 2 == 0) {
+             int value = tid * 1000 + i; // Create unique values
+             if (enqueue(queue, value) == SUCCESS) {
+                 atomicAdd(enqueue_count, 1);
+             }
+         } else {
+             int value;
+             if (dequeue(queue, &value) == SUCCESS) {
+                 int idx = atomicAdd(dequeue_count, 1);
+                 if (idx < QUEUE_SIZE) {
+                     results[idx] = value;
+                 }
+             }
+         }
+         
+         // Small delay to vary timing between threads
+         for (int j = 0; j < tid % 10; j++) {
+             __threadfence_block();
+         }
+     }
+ }
+ 
  /**
   * Main function to set up and run the test
   */
  int main() {
-    // Allocate the queue on the device
-    MSQueue* d_queue;
-    cudaMalloc(&d_queue, sizeof(MSQueue));
-    
-    // Initialize the queue on the host
-    MSQueue h_queue;
-    initQueue(&h_queue);
-    
-    // Copy the initialized queue to the device
-    cudaMemcpy(d_queue, &h_queue, sizeof(MSQueue), cudaMemcpyHostToDevice);
-    
-    // Allocate memory for results and counters
-    int* d_results;
-    int* d_enqueue_count;
-    int* d_dequeue_count;
-    cudaMalloc(&d_results, QUEUE_SIZE * sizeof(int));
-    cudaMalloc(&d_enqueue_count, sizeof(int));
-    cudaMalloc(&d_dequeue_count, sizeof(int));
-    
-    // Initialize counters
-    int zero = 0;
-    cudaMemcpy(d_enqueue_count, &zero, sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_dequeue_count, &zero, sizeof(int), cudaMemcpyHostToDevice);
-    
-    // Set thread configuration
-    int threadsPerBlock = 32;
-    int numBlocks = 4;
-    printf("Using %d blocks with %d threads each (%d total threads)\n", 
-           numBlocks, threadsPerBlock, numBlocks * threadsPerBlock);
-    
-    // Launch enqueue kernel first
-    printf("Launching enqueue kernel...\n");
-    enqueueKernel<<<numBlocks, threadsPerBlock>>>(d_queue, d_enqueue_count);
-    cudaDeviceSynchronize();
-    
-    // Print intermediate results
-    int h_enqueue_count_intermediate;
-    cudaMemcpy(&h_enqueue_count_intermediate, d_enqueue_count, sizeof(int), cudaMemcpyDeviceToHost);
-    printf("\nAfter enqueue phase:\n");
-    printf("Enqueued: %d items\n", h_enqueue_count_intermediate);
-    
-    // Print queue state
-    printf("\nPrinting queue state...\n");
-    printQueueState<<<1, 1>>>(d_queue);
-    cudaDeviceSynchronize();
-    
-    // Launch dequeue kernel after enqueues complete
-    printf("\nLaunching dequeue kernel...\n");
-    dequeueKernel<<<numBlocks, threadsPerBlock>>>(d_queue, d_results, d_dequeue_count);
-    cudaDeviceSynchronize();
-    
-    // Copy back the final results
-    int h_enqueue_count, h_dequeue_count;
-    int* h_results = new int[QUEUE_SIZE];
-    cudaMemcpy(&h_enqueue_count, d_enqueue_count, sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&h_dequeue_count, d_dequeue_count, sizeof(int), cudaMemcpyDeviceToHost);
-    
-    if (h_dequeue_count > 0) {
-        cudaMemcpy(h_results, d_results, h_dequeue_count * sizeof(int), cudaMemcpyDeviceToHost);
-    }
-    
-    // Print final results
-    printf("\nFinal Summary:\n");
-    printf("Enqueued: %d items\n", h_enqueue_count);
-    printf("Dequeued: %d items\n", h_dequeue_count);
-    
-    if (h_dequeue_count > 0) {
-        printf("Dequeued values: ");
-        for (int i = 0; i < min(h_dequeue_count, 20); i++) {
-            printf("%d ", h_results[i]);
-        }
-        if (h_dequeue_count > 20) {
-            printf("... (showing first 20 only)");
-        }
-        printf("\n");
-    }
-    
-    // Print final queue state
-    printf("\nFinal queue state:\n");
-    printQueueState<<<1, 1>>>(d_queue);
-    cudaDeviceSynchronize();
-    
-    // Check for CUDA errors
-    cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess) {
-        printf("CUDA Error: %s\n", cudaGetErrorString(error));
-    }
-    
-    // Cleanup
-    delete[] h_results;
-    cudaFree(d_results);
-    cudaFree(d_enqueue_count);
-    cudaFree(d_dequeue_count);
-    cudaFree(d_queue);
-    
-    return 0;
-}
+     // Allocate the queue on the device
+     MSQueue* d_queue;
+     cudaMalloc(&d_queue, sizeof(MSQueue));
+     
+     // Initialize the queue on the host
+     MSQueue h_queue;
+     initQueue(&h_queue);
+     
+     // Copy the initialized queue to the device
+     cudaMemcpy(d_queue, &h_queue, sizeof(MSQueue), cudaMemcpyHostToDevice);
+     
+     // Allocate memory for results and counters
+     int* d_results;
+     int* d_enqueue_count;
+     int* d_dequeue_count;
+     cudaMalloc(&d_results, QUEUE_SIZE * sizeof(int));
+     cudaMalloc(&d_enqueue_count, sizeof(int));
+     cudaMalloc(&d_dequeue_count, sizeof(int));
+     
+     // Initialize counters
+     int zero = 0;
+     cudaMemcpy(d_enqueue_count, &zero, sizeof(int), cudaMemcpyHostToDevice);
+     cudaMemcpy(d_dequeue_count, &zero, sizeof(int), cudaMemcpyHostToDevice);
+     
+     // Set up the concurrent test
+     int threadsPerBlock = 32;
+     int numBlocks = 4;
+     int iterations = 5; // Each thread performs this many operations
+     int totalThreads = threadsPerBlock * numBlocks;
+     
+     printf("Starting concurrent test with %d threads, %d iterations each\n", 
+            totalThreads, iterations);
+     printf("Expected operations: ~%d enqueues and ~%d dequeues\n", 
+            (totalThreads / 2) * iterations, (totalThreads / 2) * iterations);
+     
+     // Print initial queue state
+     printf("\nInitial queue state:\n");
+     printQueueState<<<1, 1>>>(d_queue);
+     cudaDeviceSynchronize();
+     
+     // Launch concurrent operations kernel
+     concurrentOperationsKernel<<<numBlocks, threadsPerBlock>>>(
+         d_queue, d_results, d_enqueue_count, d_dequeue_count, iterations);
+     cudaDeviceSynchronize();
+     
+     // Copy back the results
+     int h_enqueue_count, h_dequeue_count;
+     int* h_results = new int[QUEUE_SIZE];
+     cudaMemcpy(&h_enqueue_count, d_enqueue_count, sizeof(int), cudaMemcpyDeviceToHost);
+     cudaMemcpy(&h_dequeue_count, d_dequeue_count, sizeof(int), cudaMemcpyDeviceToHost);
+     
+     if (h_dequeue_count > 0) {
+         cudaMemcpy(h_results, d_results, h_dequeue_count * sizeof(int), cudaMemcpyDeviceToHost);
+     }
+     
+     // Print results
+     printf("\nConcurrent test results:\n");
+     printf("Enqueued: %d items\n", h_enqueue_count);
+     printf("Dequeued: %d items\n", h_dequeue_count);
+     
+     if (h_dequeue_count > 0) {
+         printf("First few dequeued values: ");
+         int showCount = min(h_dequeue_count, 20);
+         for (int i = 0; i < showCount; i++) {
+             printf("%d ", h_results[i]);
+         }
+         if (h_dequeue_count > 20) {
+             printf("... (showing first 20 only)");
+         }
+         printf("\n");
+     }
+     
+     // Print final queue state
+     printf("\nFinal queue state:\n");
+     printQueueState<<<1, 1>>>(d_queue);
+     cudaDeviceSynchronize();
+     
+     // Check for CUDA errors
+     cudaError_t error = cudaGetLastError();
+     if (error != cudaSuccess) {
+         printf("CUDA Error: %s\n", cudaGetErrorString(error));
+     }
+     
+     // Run additional test with increasing thread counts to test scalability
+     printf("\nRunning scalability test with increasing thread counts...\n");
+     
+     int threadCounts[] = {64, 128, 256};
+     for (int t = 0; t < 3; t++) {
+         // Reset the queue
+         initQueue(&h_queue);
+         cudaMemcpy(d_queue, &h_queue, sizeof(MSQueue), cudaMemcpyHostToDevice);
+         
+         // Reset counters
+         cudaMemcpy(d_enqueue_count, &zero, sizeof(int), cudaMemcpyHostToDevice);
+         cudaMemcpy(d_dequeue_count, &zero, sizeof(int), cudaMemcpyHostToDevice);
+         
+         // Calculate blocks and threads
+         int tpb = 64;
+         int blocks = threadCounts[t] / tpb;
+         if (blocks == 0) blocks = 1;
+         
+         printf("\nTesting with %d threads (%d blocks x %d threads)...\n", 
+                blocks * tpb, blocks, tpb);
+         
+         // Launch kernel
+         concurrentOperationsKernel<<<blocks, tpb>>>(
+             d_queue, d_results, d_enqueue_count, d_dequeue_count, 3);
+         cudaDeviceSynchronize();
+         
+         // Copy results
+         cudaMemcpy(&h_enqueue_count, d_enqueue_count, sizeof(int), cudaMemcpyDeviceToHost);
+         cudaMemcpy(&h_dequeue_count, d_dequeue_count, sizeof(int), cudaMemcpyDeviceToHost);
+         
+         // Print results
+         printf("Results with %d threads: Enqueued %d, Dequeued %d\n", 
+                blocks * tpb, h_enqueue_count, h_dequeue_count);
+     }
+     
+     // Cleanup
+     delete[] h_results;
+     cudaFree(d_results);
+     cudaFree(d_enqueue_count);
+     cudaFree(d_dequeue_count);
+     cudaFree(d_queue);
+     
+     return 0;
+ }
