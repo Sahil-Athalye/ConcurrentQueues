@@ -1,9 +1,2 @@
-# Ignore all executables (files with no extension on Unix/Linux)
-*
-!*/
-!*.*
-
-# Explicitly ignore the compiled binaries we're creating
-lockFree
-blocking
-flatCombining
+# Ignore debug folder
+debug/

@@ -1,8 +1,9 @@
+mkdir -p debug
 # Compile the lock-free queue (Michael-Scott)
-nvcc -o lockFree lockFreeQueue.cu
+nvcc -o ./debug/lockFree ./src/lockFreeQueue.cu
 
 # Compile the high-throughput blocking queue
-nvcc -o blocking blockingQueue.cu
+nvcc -o ./debug/blocking ./src/blockingQueue.cu
 
 # Compile the flat-combining queue
-nvcc -o flatCombining flatCombiningQueue.cu
+nvcc -o ./debug/flatCombining ./src/flatCombiningQueue.cu
