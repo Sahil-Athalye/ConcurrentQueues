@@ -59,6 +59,7 @@
   * Enqueue an item (blocking)
   */
  __device__ int enqueue(HTQueue* queue, unsigned int item) {
+    // printf("Enqueueing: %u\n", item);
      // Check if queue is closed
      if (atomicAdd((int*)&queue->closed, 0) != 0) {
          return CLOSED;
@@ -96,40 +97,62 @@
  /**
   * Dequeue an item (blocking)
   */
- __device__ int dequeue(HTQueue* queue, unsigned int* item) {
-     // Check if queue is closed
-     if (atomicAdd((int*)&queue->closed, 0) != 0) {
-         return CLOSED;
-     }
-     
-     // Get a ticket by atomically incrementing head
-     unsigned int ticket = atomicAdd((unsigned int*)&queue->head, 1);
-     unsigned int target = ticket % QUEUE_SIZE;
-     unsigned int id = GET_ID(ticket) + 1; // +1 for dequeue ID
-     
-     // Wait until our slot is available (id matches expected id)
-     while (atomicAdd((unsigned int*)&queue->ids[target], 0) != id) {
-         // Check if queue was closed while waiting
-         if (atomicAdd((int*)&queue->closed, 0) != 0) {
-             // Rollback the ticket
-             atomicSub((unsigned int*)&queue->head, 1);
-             return CLOSED;
-         }
-         
-         // Simple exponential backoff
-         for (int i = 0; i < 32; i++) {
-             __threadfence();
-         }
-     }
-     
-     // Get the item from the queue
-     *item = atomicAdd((unsigned int*)&queue->items[target], 0);
-     
-     // Update the ID to allow the next operation on this slot
-     INC_SAFE(queue->ids, target, id);
-     
-     return SUCCESS;
- }
+  __device__ int dequeue(HTQueue* queue, unsigned int* item) {
+    // printf("Attempting to dequeue...\n");
+    
+    // Check if queue is closed
+    if (atomicAdd((int*)&queue->closed, 0) != 0) {
+        printf("Queue is closed\n");
+        return CLOSED;
+    }
+    
+    // Get a ticket
+    unsigned int ticket = atomicAdd((unsigned int*)&queue->head, 1);
+    unsigned int target = ticket % QUEUE_SIZE;
+    unsigned int id = GET_ID(ticket) + 1; // +1 for dequeue ID
+    
+    // printf("Dequeue: waiting with ticket=%u, target=%u, id=%u, ids[target]=%u\n", 
+    //        ticket, target, id, atomicAdd((unsigned int*)&queue->ids[target], 0));
+    
+    // Wait until our slot is available
+    int wait_count = 0;
+    while (atomicAdd((unsigned int*)&queue->ids[target], 0) != id) {
+        // Print every 1000 iterations to avoid flooding stdout
+        if (wait_count++ % 1000 == 0) {
+            // printf("Still waiting: ticket=%u, target=%u, id=%u, ids[target]=%u\n", 
+            //        ticket, target, id, atomicAdd((unsigned int*)&queue->ids[target], 0));
+        }
+        
+        // Add a timeout or escape mechanism
+        if (wait_count > 1000000) {
+            // printf("Giving up after too many attempts\n");
+            // Rollback the ticket to avoid permanently breaking the queue
+            atomicSub((unsigned int*)&queue->head, 1);
+            return BUSY;
+        }
+        
+        // Check if queue was closed
+        if (atomicAdd((int*)&queue->closed, 0) != 0) {
+            // printf("Queue closed while waiting\n");
+            atomicSub((unsigned int*)&queue->head, 1);
+            return CLOSED;
+        }
+        
+        // Simple backoff
+        for (int i = 0; i < 32; i++) {
+            __threadfence();
+        }
+    }
+    
+    // Get the item
+    *item = atomicAdd((unsigned int*)&queue->items[target], 0);
+    // printf("Dequeue successful: got item %u\n", *item);
+    
+    // Update the ID
+    INC_SAFE(queue->ids, target, id);
+    
+    return SUCCESS;
+}
  
  /**
   * Enqueue an item (non-waiting)
