@@ -1,0 +1,51 @@
+#include <cuda_runtime.h>
+#include <stdio.h>
+#include <chrono>
+#include "blockingQueue.cu"
+
+#define TOTAL_OPS 1000
+#define MAX_THREADS 1024
+
+__global__ void queueTimingKernel(HTQueue* queue, int opsPerThread) {
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+
+    for (int i = 0; i < opsPerThread; ++i) {
+        if (tid % 2 == 0) {
+            enqueue(queue, tid + i * 1000);
+        } else {
+            unsigned int val;
+            dequeue(queue, &val);
+        }
+    }
+}
+
+void runTimedTest(int numThreads) {
+    HTQueue* d_queue;
+    HTQueue h_queue;
+    initQueue(&h_queue);
+    cudaMalloc(&d_queue, sizeof(HTQueue));
+    cudaMemcpy(d_queue, &h_queue, sizeof(HTQueue), cudaMemcpyHostToDevice);
+
+    int opsPerThread = TOTAL_OPS / numThreads;
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    int blocks = (numThreads + 255) / 256;
+    queueTimingKernel<<<blocks, 256>>>(d_queue, opsPerThread);
+    cudaDeviceSynchronize();
+
+    auto end = std::chrono::high_resolution_clock::now();
+    long duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+
+    printf("Threads: %d | Time: %ld microseconds\n", numThreads, duration);
+
+    cudaFree(d_queue);
+}
+
+int main() {
+    for (int threads = 1; threads <= MAX_THREADS; threads *= 2) {
+        runTimedTest(threads);
+    }
+    return 0;
+}
+
