@@ -278,7 +278,6 @@
 __global__ void concurrentOperationsKernel(MSQueue* queue, int* results, int* enqueue_count, int* dequeue_count, int* operation_sequence, int iterations) {
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
 
-    printf("op");
     for (int i = 0; i < iterations; i++) {
         // Get the operation from the list
         int op = operation_sequence[tid * iterations + i]; // Each thread uses the list to perform the correct operation
@@ -355,7 +354,7 @@ int main() {
     int threadsPerBlock = 32;
 
     // Loop through different block configurations
-    for (int numBlocks = 1; numBlocks <= 8; numBlocks++) {
+    for (int numBlocks = 1; numBlocks <= 49; numBlocks++) {
         // Test with the current configuration
         int totalThreads = threadsPerBlock * numBlocks;
 
@@ -403,4 +402,3 @@ int main() {
 
     return 0;
 }
-
