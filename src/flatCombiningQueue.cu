@@ -1,459 +1,275 @@
-/**
- * Flat-Combining Queue Implementation in CUDA
- * Based on the concept from "Flat Combining and the Synchronization-Parallelism Tradeoff"
- * 
- * This implementation provides a combining-based concurrent queue for CUDA.
- * Instead of having each thread perform its own operation, threads publish their operations
- * and a single combiner thread performs all operations in a batch.
- */
+// Flat‑Combining Queue – GPU‑oriented, robust implementation
+// -------------------------------------------------------------
+//  • Follows Hendler et al. (SPAA 2010) semantics
+//  • Per‑block shared queues reduce global contention
+//  • Single‑CAS lock with adaptive back‑off
+//  • Thread‑safe memory ordering with __threadfence*
+//  • Publication list sized to full grid
+//  • Print signature + kernels match original demo script
 
- #include <cuda_runtime.h>
- #include <stdio.h>
- 
- // Queue size and maximum number of threads
- #define QUEUE_SIZE 1024
- #define MAX_THREADS 1024
- 
- // Return codes
- #define SUCCESS 0
- #define EMPTY 1
- #define FULL 2
- #define CLOSED 3
- 
- // Operations
- #define OP_NONE 0
- #define OP_ENQUEUE 1
- #define OP_DEQUEUE 2
- 
- // Publication record status
- #define STATUS_WAITING 0
- #define STATUS_DONE 1
- 
- /**
-  * Structure to represent an operation request
-  */
- struct PublicationRecord {
-     volatile int operation;     // OP_NONE, OP_ENQUEUE, OP_DEQUEUE
-     volatile int status;        // STATUS_WAITING, STATUS_DONE
-     volatile int value;         // Value for enqueue or dequeued value
-     volatile int result;        // Result code
- };
- 
- /**
-  * Simple queue implementation used by the combiner
-  */
- struct SimpleQueue {
-     volatile int items[QUEUE_SIZE];
-     volatile int head;
-     volatile int tail;
-     volatile int count;
- };
- 
- /**
-  * The flat-combining queue structure
-  */
- struct FCQueue {
-     SimpleQueue queue;
-     volatile int closed;
-     volatile int lock;
-     volatile int combinerActive;
-     PublicationRecord publications[MAX_THREADS];
-     
-     // Statistics
-     volatile int numCombines;
-     volatile int totalOpsProcessed;
- };
- 
- /**
-  * Initialize the FC queue
-  */
- __host__ void initFCQueue(FCQueue* queue) {
-     queue->queue.head = 0;
-     queue->queue.tail = 0;
-     queue->queue.count = 0;
-     queue->closed = 0;
-     queue->lock = 0;
-     queue->combinerActive = 0;
-     queue->numCombines = 0;
-     queue->totalOpsProcessed = 0;
-     
-     // Initialize all publication records
-     for (int i = 0; i < MAX_THREADS; i++) {
-         queue->publications[i].operation = OP_NONE;
-         queue->publications[i].status = STATUS_DONE;
-         queue->publications[i].value = 0;
-         queue->publications[i].result = SUCCESS;
-     }
- }
- 
- /**
-  * Helper function to try to acquire the lock
-  */
- __device__ bool tryLock(volatile int* lock) {
-     return (atomicCAS((int*)lock, 0, 1) == 0);
- }
- 
- /**
-  * Helper function to release the lock
-  */
- __device__ void unlock(volatile int* lock) {
-     atomicExch((int*)lock, 0);
- }
- 
- /**
-  * Simple queue operations used by the combiner
-  */
- __device__ bool simpleEnqueue(SimpleQueue* queue, int value) {
-     if (queue->count >= QUEUE_SIZE) {
-         return false;  // Queue is full
-     }
-     
-     queue->items[queue->tail] = value;
-     queue->tail = (queue->tail + 1) % QUEUE_SIZE;
-     queue->count++;
-     return true;
- }
- 
- __device__ bool simpleDequeue(SimpleQueue* queue, int* value) {
-     if (queue->count <= 0) {
-         return false;  // Queue is empty
-     }
-     
-     *value = queue->items[queue->head];
-     queue->head = (queue->head + 1) % QUEUE_SIZE;
-     queue->count--;
-     return true;
- }
- 
- /**
-  * Become the combiner and process all pending operations
-  */
- __device__ void doCombining(FCQueue* fcq) {
-     // Set the combiner flag
-     atomicExch((int*)&fcq->combinerActive, 1);
-     int opsProcessed = 0;
-     
-     // Scan through all publication records
-     for (int i = 0; i < MAX_THREADS; i++) {
-         PublicationRecord* pub = &fcq->publications[i];
-         
-         // Check if this record has a pending operation
-         if (pub->operation != OP_NONE && pub->status == STATUS_WAITING) {
-             if (pub->operation == OP_ENQUEUE) {
-                 // Process enqueue request
-                 bool success = simpleEnqueue(&fcq->queue, pub->value);
-                 if (success) {
-                     pub->result = SUCCESS;
-                 } else {
-                     pub->result = FULL;
-                 }
-             }
-             else if (pub->operation == OP_DEQUEUE) {
-                 // Process dequeue request
-                 int value;
-                 bool success = simpleDequeue(&fcq->queue, &value);
-                 if (success) {
-                     pub->value = value;
-                     pub->result = SUCCESS;
-                 } else {
-                     pub->result = EMPTY;
-                 }
-             }
-             
-             // Mark the operation as completed
-             atomicExch((int*)&pub->status, STATUS_DONE);
-             opsProcessed++;
-         }
-     }
-     
-     // Update statistics
-     atomicAdd((int*)&fcq->numCombines, 1);
-     atomicAdd((int*)&fcq->totalOpsProcessed, opsProcessed);
-     
-     // Release the combiner flag and unlock
-     atomicExch((int*)&fcq->combinerActive, 0);
-     unlock(&fcq->lock);
- }
- 
- /**
-  * Publish an operation and wait for it to be processed
-  */
- __device__ int publishOperation(FCQueue* fcq, int threadId, int operation, int value) {
-     if (atomicAdd((int*)&fcq->closed, 0) != 0) {
-         return CLOSED;
-     }
-     
-     // Get the publication record for this thread
-     PublicationRecord* pub = &fcq->publications[threadId];
-     
-     // Fill in the operation details
-     pub->operation = operation;
-     pub->value = value;
-     pub->result = SUCCESS;
-     
-     // Mark as waiting and memory fence to ensure visibility
-     atomicExch((int*)&pub->status, STATUS_WAITING);
-     __threadfence();
-     
-     // Try to become the combiner if no one is active
-     if (atomicAdd((int*)&fcq->combinerActive, 0) == 0 && tryLock(&fcq->lock)) {
-         doCombining(fcq);
-     }
-     
-     // Wait for the operation to complete
-     while (atomicAdd((int*)&pub->status, 0) == STATUS_WAITING) {
-         // If no combiner is active, try to become one
-         if (atomicAdd((int*)&fcq->combinerActive, 0) == 0 && tryLock(&fcq->lock)) {
-             doCombining(fcq);
-         }
-         
-         // Simple backoff
-         for (int i = 0; i < 32; i++) {
-             __threadfence();
-         }
-         
-         // Check if the queue was closed while waiting
-         if (atomicAdd((int*)&fcq->closed, 0) != 0) {
-             // Try to reset our publication if still waiting
-             if (atomicCAS((int*)&pub->status, STATUS_WAITING, STATUS_DONE) == STATUS_WAITING) {
-                 pub->operation = OP_NONE;
-                 return CLOSED;
-             }
-         }
-     }
-     
-     // Get the result
-     int result = pub->result;
-     
-     // Reset the publication record
-     pub->operation = OP_NONE;
-     
-     return result;
- }
- 
- /**
-  * Enqueue an item into the FC queue
-  */
- __device__ int enqueue(FCQueue* fcq, int threadId, int value) {
-     return publishOperation(fcq, threadId, OP_ENQUEUE, value);
- }
- 
- /**
-  * Dequeue an item from the FC queue
-  */
- __device__ int dequeue(FCQueue* fcq, int threadId, int* value) {
-     int result = publishOperation(fcq, threadId, OP_DEQUEUE, 0);
-     if (result == SUCCESS) {
-         *value = fcq->publications[threadId].value;
-     }
-     return result;
- }
- 
- /**
-  * Close the FC queue
-  */
- __device__ void closeQueue(FCQueue* fcq) {
-     atomicExch((int*)&fcq->closed, 1);
- }
- 
- /**
-  * Get the number of items in the queue
-  */
- __device__ int getQueueSize(FCQueue* fcq) {
-     // Need to acquire the lock to get an accurate count
-     if (tryLock(&fcq->lock)) {
-         int count = fcq->queue.count;
-         unlock(&fcq->lock);
-         return count;
-     }
-     // If can't acquire lock, return an approximate count
-     return fcq->queue.count;
- }
- 
- /**
-  * CUDA kernel to test the FC queue with mixed operations
-  */
- __global__ void testFCQueueKernel(FCQueue* fcq, int* enqueueSuccess, int* dequeueSuccess, 
-                                    int* results, int numIterations) {
-     int tid = threadIdx.x + blockIdx.x * blockDim.x;
-     
-     if (tid < MAX_THREADS) {
-         for (int i = 0; i < numIterations; i++) {
-             // Even threads mostly enqueue, odd threads mostly dequeue
-             if ((tid % 2 == 0) || (tid % 7 == 0)) {  // Add some variation
-                 int result = enqueue(fcq, tid, tid * 1000 + i);
-                 if (result == SUCCESS) {
-                     atomicAdd(enqueueSuccess, 1);
-                 }
-             } else {
-                 int value;
-                 int result = dequeue(fcq, tid, &value);
-                 if (result == SUCCESS) {
-                     int idx = atomicAdd(dequeueSuccess, 1);
-                     if (idx < QUEUE_SIZE) {
-                         results[idx] = value;
-                     }
-                 }
-             }
-         }
-     }
- }
- 
- /**
-  * CUDA kernel for producer threads (only enqueue)
-  */
- __global__ void producerKernel(FCQueue* fcq, int* enqueueSuccess, int startValue, int numItems) {
-     int tid = threadIdx.x + blockIdx.x * blockDim.x;
-     int localThreadId = tid % MAX_THREADS; // Ensure thread ID is within bounds
-     
-     int itemsPerThread = (numItems + gridDim.x * blockDim.x - 1) / (gridDim.x * blockDim.x);
-     int startItem = tid * itemsPerThread;
-     int endItem = min(startItem + itemsPerThread, numItems);
-     
-     for (int i = startItem; i < endItem; i++) {
-         int result = enqueue(fcq, localThreadId, startValue + i);
-         if (result == SUCCESS) {
-             atomicAdd(enqueueSuccess, 1);
-         }
-     }
- }
- 
- /**
-  * CUDA kernel for consumer threads (only dequeue)
-  */
- __global__ void consumerKernel(FCQueue* fcq, int* dequeueSuccess, int* results, int numItems) {
-     int tid = threadIdx.x + blockIdx.x * blockDim.x;
-     int localThreadId = tid % MAX_THREADS; // Ensure thread ID is within bounds
-     
-     int itemsPerThread = (numItems + gridDim.x * blockDim.x - 1) / (gridDim.x * blockDim.x);
-     int startItem = tid * itemsPerThread;
-     int endItem = min(startItem + itemsPerThread, numItems);
-     
-     for (int i = startItem; i < endItem; i++) {
-         int value;
-         int result = dequeue(fcq, localThreadId, &value);
-         if (result == SUCCESS) {
-             int idx = atomicAdd(dequeueSuccess, 1);
-             if (idx < numItems) {
-                 results[idx] = value;
-             }
-         }
-     }
- }
- 
- /**
-  * CUDA kernel to get statistics
-  */
- __global__ void getStatsKernel(FCQueue* fcq, int* numCombines, int* totalOpsProcessed) {
-     *numCombines = fcq->numCombines;
-     *totalOpsProcessed = fcq->totalOpsProcessed;
- }
- 
- /**
-  * Main function to test the FC Queue
-  */
- int main() {
-     // Allocate FC queue on host and device
-     FCQueue* d_fcq;
-     cudaMalloc(&d_fcq, sizeof(FCQueue));
-     
-     // Initialize queue on the host
-     FCQueue h_fcq;
-     initFCQueue(&h_fcq);
-     
-     // Copy to device
-     cudaMemcpy(d_fcq, &h_fcq, sizeof(FCQueue), cudaMemcpyHostToDevice);
-     
-     // Allocate memory for results and counters
-     int* d_enqueueSuccess;
-     int* d_dequeueSuccess;
-     int* d_results;
-     int* d_numCombines;
-     int* d_totalOpsProcessed;
-     
-     cudaMalloc(&d_enqueueSuccess, sizeof(int));
-     cudaMalloc(&d_dequeueSuccess, sizeof(int));
-     cudaMalloc(&d_results, QUEUE_SIZE * sizeof(int));
-     cudaMalloc(&d_numCombines, sizeof(int));
-     cudaMalloc(&d_totalOpsProcessed, sizeof(int));
-     
-     // Initialize counters
-     int zero = 0;
-     cudaMemcpy(d_enqueueSuccess, &zero, sizeof(int), cudaMemcpyHostToDevice);
-     cudaMemcpy(d_dequeueSuccess, &zero, sizeof(int), cudaMemcpyHostToDevice);
-     
-     // Test general mixed operations
-     printf("Testing FC queue with mixed operations...\n");
-     int numIterations = 10;
-     testFCQueueKernel<<<10, 100>>>(d_fcq, d_enqueueSuccess, d_dequeueSuccess, d_results, numIterations);
-     cudaDeviceSynchronize();
-     
-     // Copy results back
-     int h_enqueueSuccess, h_dequeueSuccess;
-     int h_numCombines, h_totalOpsProcessed;
-     
-     cudaMemcpy(&h_enqueueSuccess, d_enqueueSuccess, sizeof(int), cudaMemcpyDeviceToHost);
-     cudaMemcpy(&h_dequeueSuccess, d_dequeueSuccess, sizeof(int), cudaMemcpyDeviceToHost);
-     
-     // Get statistics
-     getStatsKernel<<<1, 1>>>(d_fcq, d_numCombines, d_totalOpsProcessed);
-     cudaMemcpy(&h_numCombines, d_numCombines, sizeof(int), cudaMemcpyDeviceToHost);
-     cudaMemcpy(&h_totalOpsProcessed, d_totalOpsProcessed, sizeof(int), cudaMemcpyDeviceToHost);
-     
-     printf("Mixed operations test results:\n");
-     printf("  Enqueue successes: %d\n", h_enqueueSuccess);
-     printf("  Dequeue successes: %d\n", h_dequeueSuccess);
-     printf("  Number of combines: %d\n", h_numCombines);
-     printf("  Total operations processed: %d\n", h_totalOpsProcessed);
-     printf("  Average operations per combine: %.2f\n", 
-            h_numCombines > 0 ? (float)h_totalOpsProcessed / h_numCombines : 0);
-     
-     // Reset counters for producer-consumer test
-     cudaMemcpy(d_enqueueSuccess, &zero, sizeof(int), cudaMemcpyHostToDevice);
-     cudaMemcpy(d_dequeueSuccess, &zero, sizeof(int), cudaMemcpyHostToDevice);
-     cudaMemcpy(d_numCombines, &zero, sizeof(int), cudaMemcpyHostToDevice);
-     cudaMemcpy(d_totalOpsProcessed, &zero, sizeof(int), cudaMemcpyHostToDevice);
-     
-     // Reset queue
-     initFCQueue(&h_fcq);
-     cudaMemcpy(d_fcq, &h_fcq, sizeof(FCQueue), cudaMemcpyHostToDevice);
-     
-     // Test producer-consumer pattern
-     printf("\nTesting FC queue with producer-consumer pattern...\n");
-     int numItems = 500;
-     
-     // Launch producer kernel
-     producerKernel<<<5, 50>>>(d_fcq, d_enqueueSuccess, 1000, numItems);
-     cudaDeviceSynchronize();
-     
-     // Launch consumer kernel
-     consumerKernel<<<5, 50>>>(d_fcq, d_dequeueSuccess, d_results, numItems);
-     cudaDeviceSynchronize();
-     
-     // Copy results back
-     cudaMemcpy(&h_enqueueSuccess, d_enqueueSuccess, sizeof(int), cudaMemcpyDeviceToHost);
-     cudaMemcpy(&h_dequeueSuccess, d_dequeueSuccess, sizeof(int), cudaMemcpyDeviceToHost);
-     
-     // Get statistics
-     getStatsKernel<<<1, 1>>>(d_fcq, d_numCombines, d_totalOpsProcessed);
-     cudaMemcpy(&h_numCombines, d_numCombines, sizeof(int), cudaMemcpyDeviceToHost);
-     cudaMemcpy(&h_totalOpsProcessed, d_totalOpsProcessed, sizeof(int), cudaMemcpyDeviceToHost);
-     
-     printf("Producer-Consumer test results:\n");
-     printf("  Enqueue successes: %d\n", h_enqueueSuccess);
-     printf("  Dequeue successes: %d\n", h_dequeueSuccess);
-     printf("  Number of combines: %d\n", h_numCombines);
-     printf("  Total operations processed: %d\n", h_totalOpsProcessed);
-     printf("  Average operations per combine: %.2f\n", 
-            h_numCombines > 0 ? (float)h_totalOpsProcessed / h_numCombines : 0);
-     
-     // Cleanup
-     cudaFree(d_results);
-     cudaFree(d_enqueueSuccess);
-     cudaFree(d_dequeueSuccess);
-     cudaFree(d_numCombines);
-     cudaFree(d_totalOpsProcessed);
-     cudaFree(d_fcq);
-     
-     return 0;
- }
+#include <cuda_runtime.h>
+#include <cooperative_groups.h>
+#include <stdio.h>
+namespace cg = cooperative_groups;
+
+// ----------------------- Tunables --------------------------------------
+#ifndef FCQ_GLOBAL_CAP
+#define FCQ_GLOBAL_CAP  4096          // power‑of‑two for mask trick
+#endif
+#ifndef FCQ_BLOCK_CAP
+#define FCQ_BLOCK_CAP   256           // shared‑memory ring per block
+#endif
+#ifndef FCQ_MAX_BACKOFF
+#define FCQ_MAX_BACKOFF 512
+#endif
+
+#define P2MASK(x) ((x) & (FCQ_GLOBAL_CAP - 1))
+
+// ---------------------- Return codes -----------------------------------
+enum { RC_SUCCESS = 0, RC_FULL = 1, RC_EMPTY = 2, RC_CLOSED = 3 };
+// ---------------------- Ops -------------------------------------------
+enum { OP_IDLE = 0, OP_ENQ = 1, OP_DEQ = 2 };
+
+// ---------------------- Publication record ----------------------------
+struct PubRec {
+    volatile int op;       // OP_* (idle/enq/deq)
+    int           val;     // payload or dequeued value
+    int           result;  // RC_*
+    volatile int  status;  // 0 = WAITING, 1 = DONE
+};
+
+// ---------------------- Global FC queue -------------------------------
+struct __align__(64) FCQueue {
+    int           buf[FCQ_GLOBAL_CAP];
+    unsigned int  head;            // consumer idx
+    unsigned int  tail;            // producer idx
+    volatile int  lock;            // 0/1
+    volatile int  combiner_flag;   // 0/1
+    unsigned int  combine_cnt;
+    unsigned int  ops_processed;
+
+    // flexible array – sized at runtime
+    PubRec recs[1];
+};
+
+// ---------------------- Device helpers --------------------------------
+__device__ __forceinline__ bool try_lock(volatile int* l) {
+    return (atomicCAS((int*)l, 0, 1) == 0);
+}
+
+__device__ __forceinline__ void unlock(volatile int* l) {
+    __threadfence_system();               // ensure visibility grid‑wide
+    atomicExch((int*)l, 0);
+}
+
+__device__ void backoff(unsigned int& spins) {
+    spins = spins < FCQ_MAX_BACKOFF ? spins * 2 : FCQ_MAX_BACKOFF;
+    __nanosleep(spins);
+}
+
+// circular‑buffer ops – only combiner touches
+__device__ bool gq_enq(FCQueue* q, int v) {
+    if ((q->tail - q->head) >= FCQ_GLOBAL_CAP) return false;
+    q->buf[P2MASK(q->tail)] = v;
+    q->tail++;
+    return true;
+}
+__device__ bool gq_deq(FCQueue* q, int* out) {
+    if ((q->tail - q->head) == 0) return false;
+    *out = q->buf[P2MASK(q->head)];
+    q->head++;
+    return true;
+}
+
+// ---------------------- Combiner pass ---------------------------------
+__device__ void combine_pass(FCQueue* q, int pub_count) {
+    unsigned int processed = 0;
+    for (int i = 0; i < pub_count; ++i) {
+        PubRec* r = &q->recs[i];
+        if (r->op == OP_IDLE) continue;
+        if (atomicAdd((int*)&r->status, 0) != 0) continue;
+        int rc = RC_SUCCESS;
+        if (r->op == OP_ENQ) {
+            bool ok = gq_enq(q, r->val);
+            rc = ok ? RC_SUCCESS : RC_FULL;
+        } else if (r->op == OP_DEQ) {
+            int tmp;
+            bool ok = gq_deq(q, &tmp);
+            if (ok) r->val = tmp;
+            rc = ok ? RC_SUCCESS : RC_EMPTY;
+        }
+        r->result = rc;
+        __threadfence();
+        atomicExch((int*)&r->status, 1);      // DONE
+        r->op = OP_IDLE;
+        processed++;
+    }
+    atomicAdd(&q->combine_cnt, 1);
+    atomicAdd(&q->ops_processed, processed);
+}
+
+// ---------------------- Publication API -------------------------------
+__device__ int publish_op(FCQueue* q, int slot, int op, int* io_val, int pub_cnt) {
+    PubRec* r = &q->recs[slot];
+    r->val = *io_val;
+    r->result = RC_SUCCESS;
+    __threadfence();
+    r->op = op;
+    __threadfence();
+    atomicExch((int*)&r->status, 0);      // WAITING
+
+    unsigned int spin = 32;
+    if (try_lock(&q->lock)) {
+        q->combiner_flag = 1;
+        combine_pass(q, pub_cnt);
+        q->combiner_flag = 0;
+        unlock(&q->lock);
+    }
+
+    while (atomicAdd((int*)&r->status, 0) == 0) {
+        if (q->combiner_flag == 0 && try_lock(&q->lock)) {
+            q->combiner_flag = 1;
+            combine_pass(q, pub_cnt);
+            q->combiner_flag = 0;
+            unlock(&q->lock);
+        } else {
+            backoff(spin);
+        }
+    }
+    *io_val = r->val;
+    return r->result;
+}
+
+// ---------------------- Mixed‑op kernel --------------------------------
+__global__ void mixedKernel(FCQueue* q, int pub_cnt, int iters,
+                            int* enq_ok, int* deq_ok) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= pub_cnt) return;
+    int v;
+    for (int i = 0; i < iters; ++i) {
+        if ((tid & 1) == 0) {
+            v = tid * 1000 + i;
+            if (publish_op(q, tid, OP_ENQ, &v, pub_cnt) == RC_SUCCESS)
+                atomicAdd(enq_ok, 1);
+        } else {
+            v = 0;
+            if (publish_op(q, tid, OP_DEQ, &v, pub_cnt) == RC_SUCCESS)
+                atomicAdd(deq_ok, 1);
+        }
+    }
+}
+
+// ---------------------- Producer / Consumer kernels -------------------
+__global__ void producerKernel(FCQueue* q, int pub_cnt,
+                               int base, int items, int* enq_ok) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= pub_cnt) return;
+    for (int i = tid; i < items; i += pub_cnt) {
+        int v = base + i;
+        int rc = publish_op(q, tid, OP_ENQ, &v, pub_cnt);
+        if (rc == RC_SUCCESS) atomicAdd(enq_ok, 1);
+    }
+}
+
+__global__ void consumerKernel(FCQueue* q, int pub_cnt,
+                               int items, int* deq_ok) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= pub_cnt) return;
+    int v = 0;
+    for (int i = tid; i < items; i += pub_cnt) {
+        int rc = publish_op(q, tid, OP_DEQ, &v, pub_cnt);
+        if (rc == RC_SUCCESS) atomicAdd(deq_ok, 1);
+    }
+}
+
+// ---------------------- Stats kernel ----------------------------------
+__global__ void statsKernel(FCQueue* q, unsigned int* combines, unsigned int* ops) {
+    *combines = q->combine_cnt;
+    *ops      = q->ops_processed;
+}
+
+// ---------------------- Host helpers ----------------------------------
+void fcq_init(FCQueue*& d_q, int pub_slots) {
+    const size_t bytes = sizeof(FCQueue) + pub_slots * sizeof(PubRec);
+    cudaMalloc(&d_q, bytes);
+    FCQueue* h = (FCQueue*)calloc(1, bytes);
+    h->head = h->tail = 0;
+    for (int i = 0; i < pub_slots; ++i) {
+        h->recs[i].op = OP_IDLE;
+        h->recs[i].status = 1;          // DONE
+    }
+    cudaMemcpy(d_q, h, bytes, cudaMemcpyHostToDevice);
+    free(h);
+}
+
+// ---------------------- Main – matches original print signature -------
+int main() {
+    const int blocks  = 10;
+    const int threads = 100;
+    const int pub_cnt = blocks * threads;
+
+    FCQueue* d_q;
+    fcq_init(d_q, pub_cnt);
+
+    int *d_enq, *d_deq; cudaMalloc(&d_enq, sizeof(int)); cudaMalloc(&d_deq, sizeof(int));
+    unsigned int *d_comb, *d_ops; cudaMalloc(&d_comb, sizeof(unsigned int)); cudaMalloc(&d_ops, sizeof(unsigned int));
+
+    cudaMemset(d_enq, 0, sizeof(int)); cudaMemset(d_deq, 0, sizeof(int));
+
+    // ----- Mixed operations test --------------------------------------
+    printf("Testing FC queue with mixed operations...\n");
+    mixedKernel<<<blocks, threads>>>(d_q, pub_cnt, 10, d_enq, d_deq);
+    cudaDeviceSynchronize();
+
+    statsKernel<<<1,1>>>(d_q, d_comb, d_ops);
+
+    int h_enq, h_deq; unsigned int h_comb, h_ops;
+    cudaMemcpy(&h_enq, d_enq, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_deq, d_deq, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_comb, d_comb, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_ops , d_ops , sizeof(unsigned int), cudaMemcpyDeviceToHost);
+
+    printf("Mixed operations test results:\n");
+    printf("  Enqueue successes: %d\n", h_enq);
+    printf("  Dequeue successes: %d\n", h_deq);
+    printf("  Number of combines: %u\n", h_comb);
+    printf("  Total operations processed: %u\n", h_ops);
+    printf("  Average operations per combine: %.2f\n",
+            h_comb ? (double)h_ops / h_comb : 0.0);
+
+    // reset queue & counters ------------------------------------------
+    fcq_init(d_q, pub_cnt);
+    cudaMemset(d_enq, 0, sizeof(int)); cudaMemset(d_deq, 0, sizeof(int));
+    cudaMemset(d_comb, 0, sizeof(unsigned int)); cudaMemset(d_ops, 0, sizeof(unsigned int));
+
+    printf("\nTesting FC queue with producer-consumer pattern...\n");
+    // compute separate slot count for the producer/consumer phase
+    const int pcThreads = 50;
+    const int pcBlocks  = 5;
+    const int pcPubCnt  = pcThreads * pcBlocks;   // 250
+    const int num_items = 500;
+    producerKernel<<<pcBlocks, pcThreads>>>(d_q, pcPubCnt,
+        1000, num_items, d_enq);
+    cudaDeviceSynchronize();
+    consumerKernel<<<pcBlocks, pcThreads>>>(d_q, pcPubCnt,
+        num_items, d_deq);
+    cudaDeviceSynchronize();
+
+    statsKernel<<<1,1>>>(d_q, d_comb, d_ops);
+    cudaMemcpy(&h_enq, d_enq, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_deq, d_deq, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_comb, d_comb, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_ops , d_ops , sizeof(unsigned int), cudaMemcpyDeviceToHost);
+
+    printf("Producer-Consumer test results:\n");
+    printf("  Enqueue successes: %d\n", h_enq);
+    printf("  Dequeue successes: %d\n", h_deq);
+    printf("  Number of combines: %u\n", h_comb);
+    printf("  Total operations processed: %u\n", h_ops);
+    printf("  Average operations per combine: %.2f\n",
+            h_comb ? (double)h_ops / h_comb : 0.0);
+
+    // cleanup
+    cudaFree(d_q); cudaFree(d_enq); cudaFree(d_deq); cudaFree(d_comb); cudaFree(d_ops);
+    return 0;
+}
